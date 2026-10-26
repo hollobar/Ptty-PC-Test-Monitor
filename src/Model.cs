@@ -60,12 +60,8 @@ public sealed class Section
     public Color Color;
     public Func<Snapshot, string> Name;
     public List<Row> Rows;
-    /// <summary>Value plotted in the graph; null for sections without one.</summary>
-    public Func<Snapshot, float?> Graph;
-    public string GraphLabel;
-    /// <summary>Fixed graph range (0–100 %), or auto-scaled when false (FPS).</summary>
-    public bool GraphIsPercent = true;
-    public readonly List<float> History = new();
+    /// <summary>The graphs this section offers (usage, temperature, FPS) in their built-in order.</summary>
+    public List<Graph> Graphs = [];
     /// <summary>Shown as a row when <see cref="Rows"/> is empty.</summary>
     public string Placeholder;
     /// <summary>Row keys in their built-in order (fans: detection order), for "기본 순서로".</summary>
@@ -82,6 +78,44 @@ public sealed class Section
         var sorted = Rows.OrderBy(Rank).ThenBy(r => DefaultOrder.IndexOf(r.Key)).ToList();
         Rows.Clear();
         Rows.AddRange(sorted);
+    }
+}
+
+public enum GraphScale
+{
+    /// <summary>Fixed 0–100 %.</summary>
+    Percent,
+    /// <summary>0 to a round number above the highest value shown (FPS).</summary>
+    Peak,
+    /// <summary>Range around the values shown, in 10 °C steps.</summary>
+    Temperature,
+}
+
+/// <summary>One history graph of a section, e.g. CPU usage or CPU temperature.</summary>
+public sealed class Graph
+{
+    /// <summary>Visibility/order key. Usage graphs keep the older "cpu.graph" key so existing settings still apply.</summary>
+    public string Key;
+    /// <summary>Full name ("CPU 온도") and the short one used next to the section name ("온도").</summary>
+    public string Label, Short;
+    public Func<Snapshot, float?> Value;
+    public GraphScale Scale;
+    public Color Color;
+    /// <summary>Samples, newest last; NaN where the sensor had no value.</summary>
+    public readonly List<float> History = new();
+
+    public const int MaxHistory = 2000;
+
+    public void Add(Snapshot s)
+    {
+        var v = Value(s);
+        History.Add(Scale switch
+        {
+            GraphScale.Percent => Math.Max(0, Math.Min(100, v ?? 0)),
+            GraphScale.Peak => Math.Max(0, v ?? 0),
+            _ => v ?? float.NaN,
+        });
+        if (History.Count > MaxHistory) History.RemoveRange(0, History.Count - MaxHistory);
     }
 }
 
@@ -107,6 +141,17 @@ public sealed class Column
 public static class Sections
 {
     public static readonly Color Accent = Color.FromArgb(96, 165, 250);
+    /// <summary>Temperature graphs, so they read apart from the usage graph in the section's own color.</summary>
+    public static readonly Color TempColor = Color.FromArgb(251, 146, 60);
+
+    /// <summary>Temperature graphs are new; they start hidden so existing layouts don't change.</summary>
+    public static readonly string[] TempGraphKeys = ["cpu.graph.temp", "gpu.graph.temp", "ram.graph.temp"];
+
+    private static List<Graph> UsageAndTemp(string key, string title, Color color, Func<Snapshot, float?> load, Func<Snapshot, float?> temp) =>
+    [
+        new Graph { Key = key + ".graph", Label = title + " 사용률", Short = "사용률", Value = load, Scale = GraphScale.Percent, Color = color },
+        new Graph { Key = key + ".graph.temp", Label = title + " 온도", Short = "온도", Value = temp, Scale = GraphScale.Temperature, Color = TempColor },
+    ];
 
     /// <param name="fpsError">Text shown as the FPS panel's name when the frame counter couldn't start.</param>
     public static List<Section> Create(Func<string> fpsError) =>
@@ -114,7 +159,7 @@ public static class Sections
         new Section
         {
             Key = "cpu", Title = "CPU", Color = Accent, Name = s => s.Cpu.Name,
-            Graph = s => s.Cpu.Load, GraphLabel = "CPU 사용률",
+            Graphs = UsageAndTemp("cpu", "CPU", Accent, s => s.Cpu.Load, s => s.Cpu.Temperature),
             Rows =
             [
                 new Row { Key = "cpu.load", Label = "사용률", Value = s => s.Cpu.Load, Unit = "%" },
@@ -126,7 +171,7 @@ public static class Sections
         new Section
         {
             Key = "gpu", Title = "GPU", Color = Color.FromArgb(74, 222, 128), Name = s => s.Gpu.Name,
-            Graph = s => s.Gpu.Load, GraphLabel = "GPU 사용률",
+            Graphs = UsageAndTemp("gpu", "GPU", Color.FromArgb(74, 222, 128), s => s.Gpu.Load, s => s.Gpu.Temperature),
             Rows =
             [
                 new Row { Key = "gpu.load", Label = "사용률", Value = s => s.Gpu.Load, Unit = "%" },
@@ -146,7 +191,7 @@ public static class Sections
         new Section
         {
             Key = "ram", Title = "RAM", Color = Color.FromArgb(192, 132, 252), Name = _ => null,
-            Graph = s => s.Ram.Load, GraphLabel = "RAM 사용률",
+            Graphs = UsageAndTemp("ram", "RAM", Color.FromArgb(192, 132, 252), s => s.Ram.Load, s => s.Ram.Temperature),
             Rows =
             [
                 new Row
@@ -163,7 +208,7 @@ public static class Sections
         {
             Key = "fps", Title = "FPS", Color = Color.FromArgb(251, 146, 60),
             Name = s => s.Fps?.ProcessName is { } n ? n + ".exe" : fpsError(),
-            Graph = s => s.Fps?.Fps, GraphLabel = "FPS", GraphIsPercent = false,
+            Graphs = [new Graph { Key = "fps.graph", Label = "FPS", Short = "FPS", Value = s => s.Fps?.Fps, Scale = GraphScale.Peak, Color = Color.FromArgb(251, 146, 60) }],
             Rows =
             [
                 new Row { Key = "fps.fps", Label = "FPS", Value = s => s.Fps?.Fps, Unit = "", Sample = 999 },

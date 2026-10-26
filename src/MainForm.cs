@@ -167,6 +167,28 @@ public sealed class MainForm : Form
         File.WriteAllText(Path.Combine(dir, "packed.txt"), Placement.FormatAll(form._settings.Placements));
         Layout("column");
 
+        // Usage + temperature graphs: below the values, then drawn behind them.
+        form._settings.Hidden.ExceptWith(Sections.TempGraphKeys);
+        Layout("two");
+        Save("graphs-below");
+        void AllModes(Action<GraphMode> set) { foreach (var key in form.SectionKeys) set(form._settings.ModeOf(key)); }
+        AllModes(m => m.Behind = true);
+        Save("graphs-behind");
+        AllModes(m => { m.ArrangeBehind = GraphArrange.Side; m.Strength = 0.45; });
+        Save("graphs-behind-side");
+        AllModes(m => { m.Behind = false; m.ArrangeBelow = GraphArrange.Side; });
+        form._settings.GraphSplit["cpu"] = 0.7;
+        Save("graphs-side-70");
+        AllModes(m => m.ArrangeBelow = GraphArrange.Overlap);
+        Save("graphs-overlap");
+        // Mixed: each section its own way.
+        form._settings.ModeOf("cpu").ArrangeBelow = GraphArrange.Side;
+        form._settings.ModeOf("gpu").Behind = true;
+        form._settings.ModeOf("ram").ArrangeBelow = GraphArrange.Stack;
+        Save("graphs-mixed");
+        AllModes(m => { m.Behind = false; m.ArrangeBelow = GraphArrange.Side; });
+        Layout("column");
+
         // Panel editor for CPU, before and after reordering columns and sub-items.
         var cpu = form._sections[0];
         void SaveEditor(string name)
@@ -277,7 +299,49 @@ public sealed class MainForm : Form
     private bool IsShown(string key) => !_settings.Hidden.Contains(key);
     private List<Section> VisibleSections => _sections.Where(s => IsShown(s.Key)).ToList();
     private List<Row> VisibleRows(Section s) => s.Rows.Where(r => IsShown(r.Key)).ToList();
-    private bool GraphVisible(Section s) => s.Graph is not null && IsShown(s.Key + ".graph");
+    /// <summary>All of <paramref name="section"/>'s graphs in the user's order.</summary>
+    public List<Graph> OrderedGraphs(Section section)
+    {
+        if (!_settings.GraphOrder.TryGetValue(section.Key, out var order)) return section.Graphs.ToList();
+        return section.Graphs.OrderBy(g => order.IndexOf(g.Key) is var i && i >= 0 ? i : int.MaxValue)
+                             .ThenBy(g => section.Graphs.IndexOf(g)).ToList();
+    }
+
+    private List<Graph> VisibleGraphs(Section s) => OrderedGraphs(s).Where(g => IsShown(g.Key)).ToList();
+
+    /// <summary>Graphs that take space below the values (none when they are drawn behind).</summary>
+    private List<Graph> GraphsBelow(Section s) => ModeOf(s).Behind ? [] : VisibleGraphs(s);
+
+    public GraphMode ModeOf(Section s) => _settings.ModeOf(s.Key);
+
+
+    public int GraphHeightOf(Section s) => _settings.GraphHeights.TryGetValue(s.Key, out var h) ? h : _settings.GraphHeight;
+    public double SplitOf(Section s) => _settings.GraphSplit.TryGetValue(s.Key, out var v) ? v : 0.5;
+    public int VisibleGraphCount(Section s) => VisibleGraphs(s).Count;
+
+    /// <summary>Share of the graph area for <paramref name="section"/>'s first graph (null = half each).</summary>
+    public void SetGraphSplit(Section section, double? split)
+    {
+        if (split is { } v) _settings.GraphSplit[section.Key] = Math.Max(Settings.MinSplit, Math.Min(Settings.MaxSplit, v));
+        else _settings.GraphSplit.Remove(section.Key);
+        SettingsChanged();
+    }
+
+    /// <summary>Graph height for <paramref name="section"/> (null = the common height).</summary>
+    public void SetGraphHeight(Section section, int? height)
+    {
+        if (height is { } h) _settings.GraphHeights[section.Key] = Math.Max(Settings.MinGraphHeight, Math.Min(Settings.MaxGraphHeight, h));
+        else _settings.GraphHeights.Remove(section.Key);
+        SettingsChanged();
+    }
+
+    /// <summary>Saves a graph order for <paramref name="section"/> (null = default order).</summary>
+    public void SetGraphOrder(Section section, List<string> keys)
+    {
+        if (keys is null) _settings.GraphOrder.Remove(section.Key);
+        else _settings.GraphOrder[section.Key] = keys;
+        SettingsChanged();
+    }
     /// <summary>All four value columns in <paramref name="section"/>'s order (user order, else 현재·최소·평균·최대).</summary>
     public List<Column> OrderedColumns(Section section)
     {
@@ -330,6 +394,34 @@ public sealed class MainForm : Form
         return Math.Max(40, Math.Min(MaxLabelW, widest)) + 6;
     }
 
+    /// <summary>Height the graphs below the values need: one band each when stacked, else one shared band.</summary>
+    private float GraphsBelowHeight(Section section, int graphHeight)
+    {
+        var n = GraphsBelow(section).Count;
+        if (n == 0) return 0;
+        var h = _settings.GraphHeights.TryGetValue(section.Key, out var own) ? own : graphHeight;
+        return ModeOf(section).ArrangeBelow == GraphArrange.Stack ? n * (GraphGap + h) : GraphGap + h;
+    }
+
+    /// <summary>
+    /// Splits <paramref name="area"/> between <paramref name="n"/> graphs: stacked or side by side by the section's
+    /// split, or all in the same place when overlapping.
+    /// </summary>
+    private List<Rectangle> SplitArea(Rectangle area, int n, GraphArrange arrange, double split)
+    {
+        if (n <= 1 || arrange == GraphArrange.Overlap) return Enumerable.Repeat(area, n).ToList();
+        var gap = S(GraphGap);
+        if (arrange == GraphArrange.Stack)
+        {
+            var first = (int)Math.Round((area.Height - gap) * split);
+            return [new Rectangle(area.X, area.Y, area.Width, first),
+                    Rectangle.FromLTRB(area.X, area.Y + first + gap, area.Right, area.Bottom)];
+        }
+        var w = (int)Math.Round((area.Width - gap) * split);
+        return [new Rectangle(area.X, area.Y, w, area.Height),
+                Rectangle.FromLTRB(area.X + w + gap, area.Y, area.Right, area.Bottom)];
+    }
+
     private SizeF PanelMinSize(Section section, int graphHeight)
     {
         var columns = VisibleColumnsFor(section);
@@ -340,7 +432,7 @@ public sealed class MainForm : Form
         var height = PanelPad + TitleH
                      + (ShowColumnTitles && rows > 0 && columns.Count > 0 ? ColTitleH : 0)
                      + (section.Rows.Count == 0 ? 1 : rows) * RowH
-                     + (GraphVisible(section) ? GraphGap + graphHeight : 0)
+                     + GraphsBelowHeight(section, graphHeight)
                      + PanelPad;
         return new SizeF(width, height);
     }
@@ -447,7 +539,7 @@ public sealed class MainForm : Form
             _settings.Zoom = Math.Max(Settings.MinZoom, Math.Min(Settings.MaxZoom, zoom));
         }
 
-        if (edge is not (WMSZ_LEFT or WMSZ_RIGHT) && VisibleSections.Any(GraphVisible))
+        if (edge is not (WMSZ_LEFT or WMSZ_RIGHT) && VisibleSections.Any(s => GraphsBelow(s).Count > 0))
             _settings.GraphHeight = GraphHeightFor(rc.Bottom - rc.Top);
 
         var size = WindowSize(Zoom, _settings.GraphHeight);
@@ -538,7 +630,7 @@ public sealed class MainForm : Form
         {
             _fpsTarget = fps.ProcessId;
             foreach (var row in _fpsSection.Rows) row.Reset();
-            _fpsSection.History.Clear();
+            foreach (var graph in _fpsSection.Graphs) graph.History.Clear();
         }
 
         foreach (var section in _sections)
@@ -547,12 +639,7 @@ public sealed class MainForm : Form
             {
                 if (row.Value(snap) is { } v) row.Add(v);
             }
-            if (section.Graph is not null)
-            {
-                var v = section.Graph(snap) ?? 0;
-                section.History.Add(section.GraphIsPercent ? Math.Max(0, Math.Min(100, v)) : Math.Max(0, v));
-                if (section.History.Count > MaxHistory) section.History.RemoveRange(0, section.History.Count - MaxHistory);
-            }
+            foreach (var graph in section.Graphs) graph.Add(snap);
         }
         WriteLog(snap);
         Invalidate();
@@ -668,6 +755,11 @@ public sealed class MainForm : Form
     {
         public readonly List<(string Key, int Left, int Right)> Columns = new();
         public readonly List<(string Key, int Top, int Bottom)> Rows = new();
+        public readonly List<(string Key, Rectangle Rect)> Graphs = new();
+        /// <summary>Whole graph area, and the gap between two stacked / side-by-side graphs (empty otherwise).</summary>
+        public Rectangle GraphArea, Divider;
+        public GraphArrange Arrange;
+        public bool Behind;
         public int LabelLeft, LabelRight, Top, Bottom;
     }
 
@@ -714,13 +806,32 @@ public sealed class MainForm : Form
         var right = r.Right - S(PanelPad);
         var y = r.Top + S(PanelPad / 2);
 
-        // Title and device / app name.
+        // Graphs behind the values fill everything under the title, drawn first so the text sits on top.
+        var mode = ModeOf(section);
+        var behind = mode.Behind ? VisibleGraphs(section) : [];
+        if (behind.Count > 0)
+        {
+            var area = Rectangle.FromLTRB(left, y + S(TitleH), right, r.Bottom - S(PanelPad));
+            var rects = SplitArea(area, behind.Count, mode.ArrangeBehind, SplitOf(section));
+            // The first graph in the order is painted last, i.e. in front.
+            for (var i = behind.Count - 1; i >= 0; i--) DrawGraph(g, behind[i], rects[i], GraphStyle.Faint, mode.Strength);
+            RecordGraphs(geometry, behind, rects, area, mode.ArrangeBehind, behind: true);
+        }
+
+        // Title, device / app name, and (graphs behind) a small legend on the right.
         DrawText(g, section.Title, _bold, section.Color, left, y, S(TitleH));
+        var legendLeft = right;
+        for (var i = behind.Count - 1; i >= 0; i--)
+        {
+            var text = "▬ " + behind[i].Short;
+            DrawTextRight(g, text, _small, behind[i].Color, legendLeft, y, S(TitleH));
+            legendLeft -= TextRenderer.MeasureText(text, _small).Width + S(4);
+        }
         var name = _last is null ? null : section.Name(_last);
         if (!string.IsNullOrEmpty(name))
         {
             var nameX = left + TextRenderer.MeasureText(section.Title, _bold).Width + S(2);
-            DrawTextIn(g, Shorten(name), _small, Dim, new Rectangle(nameX, y, Math.Max(0, right - nameX), S(TitleH)));
+            DrawTextIn(g, Shorten(name), _small, Dim, new Rectangle(nameX, y, Math.Max(0, legendLeft - S(4) - nameX), S(TitleH)));
         }
         y += S(TitleH);
 
@@ -778,78 +889,148 @@ public sealed class MainForm : Form
 
         if (geometry is not null) geometry.Bottom = y;
 
-        // The graph takes whatever height is left, so a panel stretched over several rows grows its graph.
-        if (GraphVisible(section))
+        // Graphs below share whatever height is left, so a panel stretched over several rows grows its graphs.
+        var below = GraphsBelow(section);
+        if (below.Count > 0)
         {
-            y += S(GraphGap);
-            var bottom = r.Bottom - S(PanelPad);
-            if (bottom - y > S(10)) DrawGraph(g, section, new Rectangle(left, y, right - left, bottom - y));
+            var area = Rectangle.FromLTRB(left, y + S(GraphGap), right, r.Bottom - S(PanelPad));
+            if (area.Height > S(10))
+            {
+                var arrange = mode.ArrangeBelow;
+                var rects = SplitArea(area, below.Count, arrange, SplitOf(section));
+                if (arrange == GraphArrange.Overlap && below.Count > 1)
+                {
+                    // One box: background once, lines back to front, labels left and right.
+                    DrawGraphBackground(g, area);
+                    for (var i = below.Count - 1; i >= 0; i--)
+                        DrawGraph(g, below[i], area, i == 0 ? GraphStyle.LineLabelLeft : GraphStyle.LineLabelRight);
+                }
+                else
+                {
+                    for (var i = 0; i < below.Count; i++) DrawGraph(g, below[i], rects[i], GraphStyle.Full);
+                }
+                RecordGraphs(geometry, below, rects, area, arrange, behind: false);
+            }
+        }
+    }
+
+    private void RecordGraphs(PanelGeometry geometry, List<Graph> graphs, List<Rectangle> rects, Rectangle area, GraphArrange arrange, bool behind)
+    {
+        if (geometry is null) return;
+        geometry.GraphArea = area;
+        geometry.Arrange = arrange;
+        geometry.Behind = behind;
+        for (var i = 0; i < graphs.Count; i++) geometry.Graphs.Add((graphs[i].Key, rects[i]));
+        geometry.Divider = graphs.Count == 2 && arrange != GraphArrange.Overlap
+            ? arrange == GraphArrange.Stack
+                ? Rectangle.FromLTRB(area.Left, rects[0].Bottom, area.Right, rects[1].Top)
+                : Rectangle.FromLTRB(rects[0].Right, area.Top, rects[1].Left, area.Bottom)
+            : Rectangle.Empty;
+    }
+
+    private enum GraphStyle
+    {
+        /// <summary>Own background, grid and label.</summary>
+        Full,
+        /// <summary>Line and label only, sharing a box with another graph (label left or right).</summary>
+        LineLabelLeft, LineLabelRight,
+        /// <summary>Light line and fill without background or label, for behind the values.</summary>
+        Faint,
+    }
+
+    private void DrawGraphBackground(Graphics g, Rectangle r)
+    {
+        using (var bg = new SolidBrush(GraphBg)) g.FillRectangle(bg, r);
+        using var grid = new Pen(GridColor);
+        foreach (var pct in new[] { 25, 50, 75 })
+        {
+            var gy = r.Bottom - r.Height * pct / 100f;
+            g.DrawLine(grid, r.Left, gy, r.Right, gy);
         }
     }
 
     private static readonly float[] FpsScales = [30, 60, 90, 120, 144, 165, 240, 360, 500, 1000];
 
-    /// <summary>History, newest on the right. A wider graph shows a longer span.</summary>
-    private void DrawGraph(Graphics g, Section section, Rectangle r)
+    /// <summary>History, newest on the right; a wider graph shows a longer span.</summary>
+    private void DrawGraph(Graphics g, Graph graph, Rectangle r, GraphStyle style, double strength = 0.5)
     {
-        using (var bg = new SolidBrush(GraphBg)) g.FillRectangle(bg, r);
-        using (var grid = new Pen(GridColor))
-        {
-            foreach (var pct in new[] { 25, 50, 75 })
-            {
-                var gy = r.Bottom - r.Height * pct / 100f;
-                g.DrawLine(grid, r.Left, gy, r.Right, gy);
-            }
-        }
+        var faint = style == GraphStyle.Faint;
+        if (style == GraphStyle.Full) DrawGraphBackground(g, r);
 
         var step = Math.Max(1f, 3 * Unit);
         var count = Math.Max(2, (int)(r.Width / step) + 1);
-        var data = section.History.Skip(Math.Max(0, section.History.Count - count)).ToList();
+        var data = graph.History.Skip(Math.Max(0, graph.History.Count - count)).ToList();
+        var valid = data.Where(v => !float.IsNaN(v)).ToList();
 
-        // FPS: scale to a round number above the highest value shown.
-        var top = 100f;
-        if (!section.GraphIsPercent)
+        // Vertical range: 0–100 %, 0 to a round peak (FPS), or around the temperatures shown.
+        float bottom = 0, top = 100;
+        string range = null;
+        if (graph.Scale == GraphScale.Peak)
         {
-            var peak = data.Count > 0 ? data.Max() : 0;
+            var peak = valid.Count > 0 ? valid.Max() : 0;
             top = FpsScales.FirstOrDefault(t => t >= peak * 1.05f);
             if (top == 0) top = (float)Math.Ceiling(peak / 100) * 100;
+            range = $"위 {top:0}";
         }
+        else if (graph.Scale == GraphScale.Temperature && valid.Count > 0)
+        {
+            bottom = (float)Math.Floor((valid.Min() - 5) / 10) * 10;
+            top = (float)Math.Ceiling((valid.Max() + 5) / 10) * 10;
+            if (top - bottom < 20) top = bottom + 20;
+            range = $"{bottom:0}–{top:0}°C";
+        }
+
+        if (valid.Count >= 2) DrawGraphLine(g, graph, r, data, count, bottom, top, faint, strength);
+        if (faint) return;
 
         var span = TimeSpan.FromMilliseconds((count - 1) * (double)_settings.IntervalMs);
         var spanText = span.TotalSeconds < 120 ? $"최근 {span.TotalSeconds:0}초" : $"최근 {span.TotalMinutes:0}분";
-        var label = section.GraphIsPercent ? $"{section.GraphLabel} · {spanText}" : $"{section.GraphLabel} · {spanText} · 위 {top:0}";
+        var label = valid.Count == 0 && data.Count > 0 ? $"{graph.Label} · 센서 값 없음"
+            : range is null ? $"{graph.Label} · {spanText}" : $"{graph.Label} · {spanText} · {range}";
 
-        if (data.Count >= 2) DrawGraphLine(g, section, r, data, count, top);
-
-        // Label on top of the line, on a backing so it stays readable.
+        // Label on top of the line, on a backing so it stays readable. A second graph in the same box labels on the right.
         var labelSize = TextRenderer.MeasureText(label, _small, Size.Empty, TextFormatFlags.NoPrefix);
+        var labelWidth = Math.Min(r.Width, labelSize.Width + S(6));
+        var labelX = style == GraphStyle.LineLabelRight ? r.Right - labelWidth : r.Left;
         using (var back = new SolidBrush(Color.FromArgb(190, GraphBg)))
-            g.FillRectangle(back, r.Left, r.Top, Math.Min(r.Width, labelSize.Width + S(6)), labelSize.Height + S(2));
-        TextRenderer.DrawText(g, label, _small, new Point(r.Left + S(3), r.Top + S(1)), Dim, TextFormatFlags.NoPrefix);
+            g.FillRectangle(back, labelX, r.Top, labelWidth, labelSize.Height + S(2));
+        var labelColor = style == GraphStyle.Full ? Dim : graph.Color;
+        TextRenderer.DrawText(g, label, _small, new Rectangle(labelX + S(3), r.Top + S(1), labelWidth - S(3), labelSize.Height), labelColor,
+            TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
     }
 
-    private void DrawGraphLine(Graphics g, Section section, Rectangle r, List<float> data, int count, float top)
+    /// <summary>Filled line for the samples; gaps (NaN) split it into separate pieces.</summary>
+    private void DrawGraphLine(Graphics g, Graph graph, Rectangle r, List<float> data, int count, float bottom, float top, bool faint, double strength)
     {
-
-        var points = new PointF[data.Count];
-        for (var i = 0; i < data.Count; i++)
-        {
-            var px = r.Right - (data.Count - 1 - i) * (r.Width / (float)(count - 1));
-            points[i] = new PointF(px, r.Bottom - 1 - (r.Height - 2) * Math.Min(1f, data[i] / top));
-        }
-
         var clip = g.Clip;
         g.SetClip(r);
-        using (var path = new GraphicsPath())
+        // Behind the values the strength setting scales both; 0.5 (the default) shows clearly while the numbers stay readable.
+        using var fill = new SolidBrush(Color.FromArgb(faint ? (int)(10 + 80 * strength) : 50, graph.Color));
+        using var pen = new Pen(Color.FromArgb(faint ? (int)(30 + 225 * strength) : 255, graph.Color), Math.Max(1f, (faint ? 1f : 1.5f) * Unit));
+
+        var piece = new List<PointF>();
+        void Flush()
         {
-            path.AddLines(points);
-            path.AddLine(points[points.Length - 1], new PointF(points[points.Length - 1].X, r.Bottom));
-            path.AddLine(new PointF(points[0].X, r.Bottom), points[0]);
-            using var fill = new SolidBrush(Color.FromArgb(50, section.Color));
-            g.FillPath(fill, path);
+            if (piece.Count >= 2)
+            {
+                using var path = new GraphicsPath();
+                path.AddLines(piece.ToArray());
+                path.AddLine(piece[piece.Count - 1], new PointF(piece[piece.Count - 1].X, r.Bottom));
+                path.AddLine(new PointF(piece[0].X, r.Bottom), piece[0]);
+                g.FillPath(fill, path);
+                g.DrawLines(pen, piece.ToArray());
+            }
+            piece.Clear();
         }
-        using (var pen = new Pen(section.Color, Math.Max(1f, 1.5f * Unit)))
-            g.DrawLines(pen, points);
+
+        for (var i = 0; i < data.Count; i++)
+        {
+            if (float.IsNaN(data[i])) { Flush(); continue; }
+            var px = r.Right - (data.Count - 1 - i) * (r.Width / (float)(count - 1));
+            var t = Math.Max(0f, Math.Min(1f, (data[i] - bottom) / (top - bottom)));
+            piece.Add(new PointF(px, r.Bottom - 1 - (r.Height - 2) * t));
+        }
+        Flush();
         g.Clip = clip;
     }
 

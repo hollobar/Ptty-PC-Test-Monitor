@@ -7,6 +7,38 @@ using System.Linq;
 
 namespace PttyPcTestMonitor;
 
+/// <summary>How a section's graphs share their area: one above the other, side by side, or on top of each other.</summary>
+public enum GraphArrange { Stack, Side, Overlap }
+
+/// <summary>How one section draws its graphs: below or behind the values, arranged how, and how strongly (behind).</summary>
+public sealed class GraphMode
+{
+    public bool Behind;
+    /// <summary>Arrangement, kept separately for graphs below the values and behind them.</summary>
+    public GraphArrange ArrangeBelow = GraphArrange.Stack, ArrangeBehind = GraphArrange.Overlap;
+    /// <summary>Strength (0.05–1) of graphs drawn behind the values.</summary>
+    public double Strength = 0.5;
+
+    public GraphArrange Arrange => Behind ? ArrangeBehind : ArrangeBelow;
+
+    /// <summary>"behind,Side,Overlap,0.45"</summary>
+    public static GraphMode Parse(string text)
+    {
+        var m = new GraphMode();
+        var p = text.Split(',');
+        if (p.Length != 4) return m;
+        m.Behind = p[0] == "behind";
+        if (Enum.TryParse<GraphArrange>(p[1], out var below)) m.ArrangeBelow = below;
+        if (Enum.TryParse<GraphArrange>(p[2], out var behind)) m.ArrangeBehind = behind;
+        if (double.TryParse(p[3], NumberStyles.Float, CultureInfo.InvariantCulture, out var strength))
+            m.Strength = Math.Max(0.05, Math.Min(1.0, strength));
+        return m;
+    }
+
+    public override string ToString() =>
+        $"{(Behind ? "behind" : "below")},{ArrangeBelow},{ArrangeBehind},{Strength.ToString("0.00", CultureInfo.InvariantCulture)}";
+}
+
 /// <summary>Window preferences in %LOCALAPPDATA%\PttyPcTestMonitor\settings.ini (key=value lines).</summary>
 public sealed class Settings
 {
@@ -40,7 +72,7 @@ public sealed class Settings
     /// Display keys the user turned off: sections ("cpu"), rows ("cpu.clock", "fan:/gpu-nvidia/0/fan/1"),
     /// graphs ("gpu.graph") and value columns ("col.min").
     /// </summary>
-    public HashSet<string> Hidden = new(StringComparer.Ordinal);
+    public HashSet<string> Hidden = new(Sections.TempGraphKeys, StringComparer.Ordinal);
 
     /// <summary>Number of columns in the panel grid.</summary>
     public int GridColumns = 1;
@@ -50,6 +82,27 @@ public sealed class Settings
 
     /// <summary>User order of the value columns (col.now/min/avg/max) per section key.</summary>
     public Dictionary<string, List<string>> ColumnOrder = new(StringComparer.Ordinal);
+
+    /// <summary>User order of each section's graphs (graph keys), by section key.</summary>
+    public Dictionary<string, List<string>> GraphOrder = new(StringComparer.Ordinal);
+
+    /// <summary>Graph display mode per section key; sections without an entry use the defaults.</summary>
+    public Dictionary<string, GraphMode> GraphModes = new(StringComparer.Ordinal);
+
+    /// <summary>The section's graph mode, created with defaults on first use so it can be edited in place.</summary>
+    public GraphMode ModeOf(string sectionKey)
+    {
+        if (!GraphModes.TryGetValue(sectionKey, out var mode)) GraphModes[sectionKey] = mode = new GraphMode();
+        return mode;
+    }
+
+    /// <summary>Share (0.15–0.85) of the graph area given to a section's first graph, by section key.</summary>
+    public Dictionary<string, double> GraphSplit = new(StringComparer.Ordinal);
+
+    /// <summary>Graph height (96-DPI px) for sections that override <see cref="GraphHeight"/>, by section key.</summary>
+    public Dictionary<string, int> GraphHeights = new(StringComparer.Ordinal);
+
+    public const double MinSplit = 0.15, MaxSplit = 0.85;
 
     /// <summary>Where each section's panel sits in the grid, by section key.</summary>
     public Dictionary<string, Placement> Placements = new(StringComparer.Ordinal);
@@ -101,6 +154,22 @@ public sealed class Settings
                 s.RowOrder = ParseRowOrder(order);
             if (map.TryGetValue("ColumnOrder", out var columnOrder))
                 s.ColumnOrder = ParseRowOrder(columnOrder);
+            if (map.TryGetValue("GraphOrder", out var graphOrder))
+                s.GraphOrder = ParseRowOrder(graphOrder);
+            if (map.TryGetValue("GraphModes", out var modes))
+            {
+                foreach (var part in modes.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var kv = part.Split(new[] { ':' }, 2);
+                    if (kv.Length == 2) s.GraphModes[kv[0]] = GraphMode.Parse(kv[1]);
+                }
+            }
+            if (map.TryGetValue("GraphSplit", out var split))
+                foreach (var (key, value) in ParseNumbers(split)) s.GraphSplit[key] = Clamp(value, MinSplit, MaxSplit);
+            if (map.TryGetValue("GraphHeights", out var heights))
+                foreach (var (key, value) in ParseNumbers(heights)) s.GraphHeights[key] = (int)Clamp(value, MinGraphHeight, MaxGraphHeight);
+            // Settings saved before temperature graphs existed: start them hidden.
+            if (!map.ContainsKey("TempGraphs")) s.Hidden.UnionWith(Sections.TempGraphKeys);
         }
         catch
         {
@@ -120,6 +189,13 @@ public sealed class Settings
         }
         return result;
     }
+
+    /// <summary>"cpu:0.65;gpu:0.5"</summary>
+    private static IEnumerable<(string, double)> ParseNumbers(string text) =>
+        text.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(p => p.Split(':'))
+            .Where(kv => kv.Length == 2 && double.TryParse(kv[1], NumberStyles.Float, CultureInfo.InvariantCulture, out _))
+            .Select(kv => (kv[0], double.Parse(kv[1], CultureInfo.InvariantCulture)));
 
     public const double MinZoom = 0.6, MaxZoom = 3.0;
     public const int MinGraphHeight = 24, MaxGraphHeight = 300;
@@ -163,6 +239,13 @@ public sealed class Settings
             lines.Add($"Layout={Placement.FormatAll(Placements)}");
             lines.Add("RowOrder=" + string.Join(";", RowOrder.Select(kv => kv.Key + ">" + string.Join("|", kv.Value))));
             lines.Add("ColumnOrder=" + string.Join(";", ColumnOrder.Select(kv => kv.Key + ">" + string.Join("|", kv.Value))));
+            lines.Add("GraphOrder=" + string.Join(";", GraphOrder.Select(kv => kv.Key + ">" + string.Join("|", kv.Value))));
+            // Only modes that differ from the defaults, so a changed default still reaches untouched sections.
+            var defaults = new GraphMode().ToString();
+            lines.Add("GraphModes=" + string.Join(";", GraphModes.Where(kv => kv.Value.ToString() != defaults).Select(kv => kv.Key + ":" + kv.Value)));
+            lines.Add("GraphSplit=" + string.Join(";", GraphSplit.Select(kv => kv.Key + ":" + kv.Value.ToString("0.000", inv))));
+            lines.Add("GraphHeights=" + string.Join(";", GraphHeights.Select(kv => kv.Key + ":" + kv.Value.ToString(inv))));
+            lines.Add("TempGraphs=1");
             File.WriteAllLines(FilePath, lines);
         }
         catch

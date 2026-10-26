@@ -42,8 +42,8 @@ public sealed class OptionsForm : Form
         Font = new Font("Malgun Gothic", 9f);
         AutoScaleMode = AutoScaleMode.Font;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(680, 600);
-        MinimumSize = new Size(600, 520);
+        ClientSize = new Size(700, 700);
+        MinimumSize = new Size(620, 620);
         ShowInTaskbar = false;
         MinimizeBox = false;
 
@@ -103,6 +103,7 @@ public sealed class OptionsForm : Form
         viewFlow.Controls.AddRange(new Control[] { _viewFull, _viewCompact });
         view.Controls.Add(viewFlow);
         flow.Controls.Add(view);
+
 
         _topMost = Check("항상 위에 표시 (다른 창 위에 고정)", v => _settings.TopMost = v);
         flow.Controls.Add(_topMost);
@@ -199,14 +200,26 @@ public sealed class OptionsForm : Form
         right.Controls.Add(values);
 
         var graphs = new GroupBox { Text = "그래프", AutoSize = true, MinimumSize = new Size(200, 0), Padding = new Padding(10, 6, 10, 6), Margin = new Padding(3, 12, 3, 3) };
-        var graphsFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoSize = true, MaximumSize = new Size(210, 0) };
-        foreach (var s in _main.AllSections.Where(s => s.Graph is not null))
+        // One line per section: "CPU  ☑ 사용률  ☐ 온도".
+        var graphsTable = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 3 };
+        foreach (var s in _main.AllSections.Where(s => s.Graphs.Count > 0))
         {
-            var box = KeyCheck(s.GraphLabel, s.Key + ".graph");
-            _graphChecks.Add(box);
-            graphsFlow.Controls.Add(box);
+            graphsTable.Controls.Add(new Label { Text = s.Title, AutoSize = true, Margin = new Padding(0, 5, 8, 0) });
+            for (var i = 0; i < 2; i++)
+            {
+                if (i < s.Graphs.Count)
+                {
+                    var box = KeyCheck(s.Graphs[i].Short, s.Graphs[i].Key, minWidth: 70);
+                    _graphChecks.Add(box);
+                    graphsTable.Controls.Add(box);
+                }
+                else
+                {
+                    graphsTable.Controls.Add(new Label { AutoSize = true });
+                }
+            }
         }
-        graphs.Controls.Add(graphsFlow);
+        graphs.Controls.Add(graphsTable);
         right.Controls.Add(graphs);
         right.Controls.Add(new Label
         {
@@ -327,9 +340,9 @@ public sealed class OptionsForm : Form
         };
     }
 
-    private CheckBox KeyCheck(string text, string key)
+    private CheckBox KeyCheck(string text, string key, int minWidth = 98)
     {
-        var box = new CheckBox { Text = text, AutoSize = true, MinimumSize = new Size(98, 0), Tag = key };
+        var box = new CheckBox { Text = text, AutoSize = true, MinimumSize = new Size(minWidth, 0), Tag = key };
         box.CheckedChanged += (_, _) =>
         {
             if (!_syncing) SetShown(key, box.Checked);
@@ -499,6 +512,11 @@ public sealed class LayoutEditor : Control
     private bool _resizing;
     private Point _grab;          // grabbed cell offset inside the block
     private Placement _preview;
+    private Point _pointer, _grabPixel; // while moving, the block follows the pointer at the grabbed spot
+
+    // Blocks glide to their new places: _shown is where each is drawn now, _targets where it is heading.
+    private readonly Dictionary<string, RectangleF> _shown = new(), _targets = new();
+    private readonly Timer _glide = new() { Interval = 15 };
 
     protected override void OnMouseDoubleClick(MouseEventArgs e)
     {
@@ -520,7 +538,42 @@ public sealed class LayoutEditor : Control
         ResizeRedraw = true;
         BackColor = Color.FromArgb(245, 246, 248);
         using (var g = CreateGraphics()) _dpi = g.DpiX / 96f;
+        _glide.Tick += (_, _) => Glide();
+        Disposed += (_, _) => _glide.Dispose();
         UpdateSize();
+    }
+
+    /// <summary>
+    /// The layout as it would be if the dragged block were dropped now: the others make room (and empty
+    /// columns/rows close) exactly as they will on release.
+    /// </summary>
+    private Dictionary<string, Placement> Arranged()
+    {
+        if (_active is null || _preview is null) return Settings.Placements;
+        var copy = Settings.Placements.ToDictionary(kv => kv.Key, kv => kv.Value.Clone());
+        GridLayout.Move(copy, _active, _preview.Clone(), Settings.GridColumns);
+        GridLayout.Pack(copy, copy.Keys.ToList());
+        return copy;
+    }
+
+    /// <summary>Moves every block a step toward its target; stops when all have arrived.</summary>
+    private void Glide()
+    {
+        var moving = false;
+        foreach (var key in _targets.Keys.ToList())
+        {
+            var from = _shown.TryGetValue(key, out var r) ? r : _targets[key];
+            var to = _targets[key];
+            var next = new RectangleF(
+                from.X + (to.X - from.X) * 0.35f, from.Y + (to.Y - from.Y) * 0.35f,
+                from.Width + (to.Width - from.Width) * 0.35f, from.Height + (to.Height - from.Height) * 0.35f);
+            var close = Math.Abs(next.X - to.X) < 0.5f && Math.Abs(next.Y - to.Y) < 0.5f &&
+                        Math.Abs(next.Width - to.Width) < 0.5f && Math.Abs(next.Height - to.Height) < 0.5f;
+            _shown[key] = close ? to : next;
+            moving |= !close;
+        }
+        if (!moving) _glide.Stop();
+        Invalidate();
     }
 
     private Settings Settings => _main.Settings;
@@ -565,18 +618,34 @@ public sealed class LayoutEditor : Control
                     g.DrawRectangle(cellPen, CellRect(new Placement(c, r)));
         }
 
+        // Every block heads for where it would end up; the dragged one is drawn last, as a dashed ghost at its drop spot.
+        var arranged = Arranged();
+        var glide = false;
         foreach (var section in _main.AllSections)
         {
-            var p = section.Key == _active && _preview is not null ? _preview : Settings.Placements[section.Key];
-            var rect = CellRect(p);
+            var target = (RectangleF)CellRect(arranged[section.Key]);
+            _targets[section.Key] = target;
+            if (!_shown.ContainsKey(section.Key)) _shown[section.Key] = target;
+            glide |= _shown[section.Key] != target;
+        }
+        if (glide && !_glide.Enabled) _glide.Start();
+
+        foreach (var section in _main.AllSections.OrderBy(s => s.Key == _active))
+        {
+            var p = arranged[section.Key];
+            var rect = Rectangle.Round(_shown[section.Key]);
             var hidden = Settings.Hidden.Contains(section.Key);
+            var dragged = section.Key == _active;
 
             using (var fill = hidden
                        ? (Brush)new System.Drawing.Drawing2D.HatchBrush(System.Drawing.Drawing2D.HatchStyle.BackwardDiagonal, Color.FromArgb(70, section.Color), Color.FromArgb(235, 236, 240))
-                       : new SolidBrush(Color.FromArgb(section.Key == _active ? 150 : 90, section.Color)))
+                       : new SolidBrush(Color.FromArgb(dragged ? 60 : 90, section.Color)))
                 g.FillRectangle(fill, rect);
-            using (var border = new Pen(section.Color, section.Key == _active ? 2.5f * _dpi : 1.5f * _dpi))
+            using (var border = new Pen(dragged ? Sections.Accent : section.Color, dragged ? 2.5f * _dpi : 1.5f * _dpi))
+            {
+                if (dragged) border.DashStyle = System.Drawing.Drawing2D.DashStyle.Dash;
                 g.DrawRectangle(border, rect);
+            }
 
             var title = hidden ? $"{section.Title} (숨김)" : section.Title;
             var span = $"{p.ColSpan}×{p.RowSpan}";
@@ -595,7 +664,27 @@ public sealed class LayoutEditor : Control
                 new Point(rect.Right - HandleSize, rect.Bottom),
             });
         }
+
+        // The block being moved floats with the pointer; its dashed ghost above shows where it will land.
+        if (_active is not null && !_resizing)
+        {
+            var section = _main.AllSections.First(s => s.Key == _active);
+            var size = CellRect(arranged[_active]).Size;
+            var floating = new Rectangle(new Point(_pointer.X - _grabPixel.X, _pointer.Y - _grabPixel.Y), size);
+            using (var shadow = new SolidBrush(Color.FromArgb(40, 0, 0, 0)))
+                g.FillRectangle(shadow, new Rectangle(floating.X + 4, floating.Y + 4, floating.Width, floating.Height));
+            using (var fill = new SolidBrush(Color.FromArgb(220, Blend(section.Color, Color.White, 0.55f))))
+                g.FillRectangle(fill, floating);
+            using (var border = new Pen(section.Color, 2.5f * _dpi))
+                g.DrawRectangle(border, floating);
+            using var bold = new Font(Font, FontStyle.Bold);
+            TextRenderer.DrawText(g, section.Title, bold, new Rectangle(floating.X + 6, floating.Y + 4, floating.Width - 12, floating.Height / 2),
+                Color.FromArgb(30, 32, 36), TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
+        }
     }
+
+    private static Color Blend(Color a, Color b, float t) => Color.FromArgb(
+        (int)(a.R + (b.R - a.R) * t), (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t));
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
@@ -609,6 +698,8 @@ public sealed class LayoutEditor : Control
         _resizing = e.X > rect.Right - HandleSize && e.Y > rect.Bottom - HandleSize;
         var cell = CellAt(e.Location);
         _grab = new Point(cell.X - p.Col, cell.Y - p.Row);
+        _grabPixel = new Point(e.X - rect.X, e.Y - rect.Y);
+        _pointer = e.Location;
         _preview = p.Clone();
         Capture = true;
         Invalidate();
@@ -627,8 +718,12 @@ public sealed class LayoutEditor : Control
             return;
         }
 
-        var cell = CellAt(e.Location);
+        _pointer = e.Location;
         var p = Settings.Placements[_active];
+        // Snap by the block's center (not the pointer) so the drop spot follows what the user sees.
+        var cell = _resizing ? CellAt(e.Location)
+            : CellAt(new Point(e.X - _grabPixel.X + CellW / 2, e.Y - _grabPixel.Y + CellH / 2));
+        if (!_resizing) _grab = Point.Empty;
         if (_resizing)
         {
             _preview = new Placement(p.Col, p.Row,

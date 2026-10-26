@@ -17,7 +17,9 @@ CPU·GPU·RAM·팬·FPS·네트워크 속도를 현재 / 최소 / 평균 / 최�
 - **FPS:** frame rate, 1% low and frame time of the foreground app, measured through ETW present events
   (the PresentMon method). Nothing is injected into the game, so it is safe with anti-cheat.
 - **Network:** download / upload speed
-- Usage and FPS graphs, CSV logging, adjustable size / opacity / always-on-top, per-item show/hide
+- Usage, temperature and FPS graphs, per item below the values or faintly behind them, stacked / side by side /
+  overlapped, with adjustable split, height and strength
+- CSV logging, adjustable size / opacity / always-on-top, per-item show/hide
 - **Free layout:** arrange the panels on a grid and set how many cells each spans (RTSS-style editor);
   fully empty columns and rows close automatically. Double-click a block to open its panel and drag the
   value columns (current/min/avg/max) and rows into the order you want
