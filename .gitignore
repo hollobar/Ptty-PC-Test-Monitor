@@ -1,0 +1,8 @@
+# .NET build output
+**/bin/
+**/obj/
+.vs/
+*.user
+
+# Release packages (built by build.ps1; attach to GitHub Releases instead)
+dist/
